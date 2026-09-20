@@ -1,6 +1,17 @@
 package ir.choobkhat.mobile;
 
 import android.app.Activity;
+import android.Manifest;
+import android.content.Intent;
+import android.content.pm.PackageManager;
+import android.net.Uri;
+import android.provider.OpenableColumns;
+import android.database.Cursor;
+import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
+import android.media.MediaRecorder;
+import android.speech.RecognizerIntent;
+import android.speech.tts.TextToSpeech;
 import android.app.AlertDialog;
 import android.os.Bundle;
 import android.os.Handler;
@@ -27,6 +38,8 @@ import org.json.JSONObject;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.io.*;
+import java.util.ArrayList;
+import java.util.Locale;
 import java.nio.charset.StandardCharsets;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -45,11 +58,23 @@ public class MainActivity extends Activity {
     private int selected = 6;
     private boolean busy = false;
     private SharedPreferences prefs;
+    private static final int PICK_FILE=101, SPEECH=102, MIC_PERMISSION=103;
+    private static final int MAX_FILE=2*1024*1024;
+    private String pendingName="";
+    private String pendingText="";
+    private String pendingImage="";
+    private MediaRecorder recorder;
+    private File recordedAudio;
+    private TextToSpeech tts;
+    private boolean voiceMode=false;
 
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
         getWindow().setStatusBarColor(dark);
         prefs = getSharedPreferences("choobkhat_settings", MODE_PRIVATE);
+        tts=new TextToSpeech(this, result -> {
+            if(result==TextToSpeech.SUCCESS){tts.setLanguage(new Locale("fa", "IR"));}
+        });
         render();
     }
     private GradientDrawable bg(int color, int radius) {
@@ -108,7 +133,10 @@ public class MainActivity extends Activity {
         chatInput = input("پیام خود را بنویسید…"); chatInput.setSingleLine(false); chatInput.setMinLines(1); chatInput.setMaxLines(4); sendRow.addView(chatInput, new LinearLayout.LayoutParams(0,-2,1));
         Button send = button("ارسال", () -> sendMessage()); sendRow.addView(send);
         LinearLayout extras = new LinearLayout(this); add(content, extras);
-        Button mic = button("🎙 صوت (به‌زودی)", () -> toast("قابلیت صوتی هنوز فعال نیست.")); extras.addView(mic);
+        Button mic = button("🎙 مکالمه صوتی", () -> startVoice()); extras.addView(mic);
+        Button record = button("● ضبط صدا", () -> toggleRecording()); extras.addView(record);
+        Button attach = button("＋ عکس/فایل/صدا", () -> chooseFile()); extras.addView(attach);
+        if(!pendingName.isEmpty()) add(content, text("پیوست آماده: "+pendingName+" (با ارسال پیام فرستاده می‌شود)",12,dark));
         Button clear = button("گفتگوی جدید", () -> { if(busy) return; while(history.length()>0) history.remove(0); showFeature(); }); extras.addView(clear);
     }
     private void addBubble(String message, boolean user) {
@@ -118,20 +146,174 @@ public class MainActivity extends Activity {
     }
     private void sendMessage() {
         if (busy) return;
-        String message = chatInput.getText().toString().trim(); if(message.isEmpty()) return;
+        String message = chatInput.getText().toString().trim();
+        if(message.isEmpty() && pendingImage.isEmpty() && pendingText.isEmpty()) return;
+        if(message.isEmpty()) message="لطفاً پیوست را بررسی کن.";
+        final String visibleMessage=message;
+        final String attachmentText=pendingText, attachmentImage=pendingImage, attachmentName=pendingName;
         String key = getKey(), model = prefs.getString("model", "gpt-5.4-mini").trim();
         if (key.isEmpty() || model.isEmpty()) { toast("ابتدا کلید API و نام مدل را در تنظیمات وارد کنید."); return; }
         if (!"api".equals(prefs.getString("mode", "api"))) { toast("اتصال سرور داخلی هنوز پیاده‌سازی نشده؛ حالت API را انتخاب کنید."); return; }
-        try { history.put(new JSONObject().put("role","user").put("content",message)); } catch(Exception ignored) {}
-        addBubble(message,true); chatInput.setText(""); busy=true;
+        try {
+            Object contentValue=message;
+            if(!attachmentImage.isEmpty()) {
+                JSONArray parts=new JSONArray();
+                parts.put(new JSONObject().put("type","text").put("text",message));
+                parts.put(new JSONObject().put("type","image_url").put("image_url",new JSONObject().put("url",attachmentImage)));
+                contentValue=parts;
+            } else if(!attachmentText.isEmpty()) contentValue=message+"\n\n--- پیوست: "+attachmentName+" ---\n"+attachmentText;
+            history.put(new JSONObject().put("role","user").put("content",contentValue));
+        } catch(Exception e) {toast("پیوست معتبر نیست.");return;}
+        addBubble(visibleMessage+(attachmentName.isEmpty()?"":" 📎 "+attachmentName),true);
+        pendingName="";pendingImage="";pendingText="";
+        chatInput.setText(""); busy=true;
         executor.execute(() -> {
             try {
                 JSONObject body=new JSONObject(); body.put("model",model); body.put("messages",new JSONArray(history.toString()));
                 JSONObject response=request("POST", apiUrl()+"/chat/completions",key,body);
                 JSONArray choices=response.getJSONArray("choices"); String answer=choices.getJSONObject(0).getJSONObject("message").optString("content", "");
                 if(answer.isEmpty()) throw new IOException("پاسخ متنی خالی است؛ نام مدل را بررسی کنید.");
-                main.post(() -> { try { history.put(new JSONObject().put("role","assistant").put("content",answer)); } catch(Exception ignored){} if(selected==6) addBubble(answer,false); status.setTextColor(Color.GREEN); busy=false; });
-            } catch(Exception e) { main.post(() -> { if(selected==6) addBubble("خطای ارتباط: "+e.getMessage(),false); status.setTextColor(Color.RED); busy=false; }); }
+                main.post(() -> { try { history.put(new JSONObject().put("role","assistant").put("content",answer)); } catch(Exception ignored){} if(selected==6) addBubble(answer,false); status.setTextColor(Color.GREEN); busy=false;
+                    if(voiceMode) { speak(answer); } });
+            } catch(Exception e) { main.post(() -> { if(selected==6) addBubble("خطای ارتباط: "+e.getMessage(),false); status.setTextColor(Color.RED); busy=false; voiceMode=false; }); }
+        });
+    }
+    private void chooseFile() {
+        Intent pick=new Intent(Intent.ACTION_OPEN_DOCUMENT);
+        pick.addCategory(Intent.CATEGORY_OPENABLE);
+        pick.setType("*/*");
+        pick.putExtra(Intent.EXTRA_MIME_TYPES,new String[]{"image/*","audio/*","text/plain","text/csv","application/json"});
+        startActivityForResult(pick,PICK_FILE);
+    }
+    private void startVoice() {
+        voiceMode=true;
+        listen();
+    }
+    private void listen() {
+        if(busy) {toast("منتظر پاسخ قبلی باشید.");return;}
+        Intent i=new Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH);
+        i.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL,RecognizerIntent.LANGUAGE_MODEL_FREE_FORM);
+        i.putExtra(RecognizerIntent.EXTRA_LANGUAGE,"fa-IR");
+        i.putExtra(RecognizerIntent.EXTRA_PROMPT,"صحبت کنید؛ برای پایان، بازگشت را بزنید.");
+        try{startActivityForResult(i,SPEECH);}catch(Exception e){voiceMode=false;toast("تشخیص گفتار روی این دستگاه موجود نیست؛ از ضبط صدا استفاده کنید.");}
+    }
+    private void speak(String answer){
+        if(tts==null){voiceMode=false;return;}
+        String spoken=answer.length()>3500?answer.substring(0,3500):answer;
+        tts.speak(spoken,TextToSpeech.QUEUE_FLUSH,null,"choobkhat_reply");
+        // User taps the voice button again to continue; do not auto-open microphone.
+        toast("پاسخ صوتی پخش می‌شود. برای ادامه دوباره مکالمه صوتی را بزنید.");
+        voiceMode=false;
+    }
+    private void toggleRecording(){
+        if(recorder!=null){
+            try{recorder.stop();recorder.release();recorder=null;toast("ضبط تمام شد؛ در حال تبدیل صدا به متن...");transcribeAudio(recordedAudio,"صدای ضبط‌شده","audio/mp4");}
+            catch(Exception e){recorder.release();recorder=null;toast("ضبط صدا ناموفق بود.");}
+            return;
+        }
+        if(android.os.Build.VERSION.SDK_INT>=23 && checkSelfPermission(Manifest.permission.RECORD_AUDIO)!=PackageManager.PERMISSION_GRANTED){
+            requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO},MIC_PERMISSION);return;
+        }
+        try{
+            recordedAudio=File.createTempFile("choobkhat-", ".m4a",getCacheDir());
+            recorder=new MediaRecorder();
+            recorder.setAudioSource(MediaRecorder.AudioSource.MIC);
+            recorder.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4);
+            recorder.setAudioEncoder(MediaRecorder.AudioEncoder.AAC);
+            recorder.setOutputFile(recordedAudio.getAbsolutePath());
+            recorder.prepare();recorder.start();toast("در حال ضبط... برای پایان دوباره «ضبط صدا» را بزنید.");
+        }catch(Exception e){if(recorder!=null){recorder.release();recorder=null;}toast("میکروفون در دسترس نیست.");}
+    }
+    @Override public void onRequestPermissionsResult(int requestCode,String[] permissions,int[] grants){
+        super.onRequestPermissionsResult(requestCode,permissions,grants);
+        if(requestCode==MIC_PERMISSION && grants.length>0 && grants[0]==PackageManager.PERMISSION_GRANTED)toggleRecording();
+    }
+    @Override protected void onActivityResult(int requestCode,int resultCode,Intent data){
+        super.onActivityResult(requestCode,resultCode,data);
+        if(resultCode!=RESULT_OK || data==null){if(requestCode==SPEECH)voiceMode=false;return;}
+        if(requestCode==SPEECH){
+            ArrayList<String> words=data.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS);
+            if(words!=null&&!words.isEmpty()&&selected==6){chatInput.setText(words.get(0));sendMessage();}
+            else voiceMode=false;
+        }else if(requestCode==PICK_FILE && data.getData()!=null){processPicked(data.getData());}
+    }
+    private void processPicked(Uri uri){
+        String mime=getContentResolver().getType(uri);if(mime==null)mime="";
+        String name="پیوست";
+        try(Cursor c=getContentResolver().query(uri,new String[]{OpenableColumns.DISPLAY_NAME},null,null,null)){
+            if(c!=null&&c.moveToFirst())name=c.getString(0);
+        }catch(Exception ignored){}
+        final String displayName=name;
+        if(mime.startsWith("audio/")){
+            try{
+                File file=File.createTempFile("attached-", ".audio",getCacheDir());
+                try(InputStream in=getContentResolver().openInputStream(uri);FileOutputStream out=new FileOutputStream(file)){
+                    byte[] buffer=new byte[8192];int n;int total=0;
+                    while((n=in.read(buffer))!=-1){total+=n;if(total>10*1024*1024)throw new IOException("فایل صوتی بیش از ۱۰ مگابایت است.");out.write(buffer,0,n);}
+                }
+                transcribeAudio(file,displayName,mime);
+            }catch(Exception e){toast("خطا در خواندن صدا: "+e.getMessage());}return;
+        }
+        try {
+            if(mime.startsWith("image/")){
+                BitmapFactory.Options bounds=new BitmapFactory.Options();bounds.inJustDecodeBounds=true;
+                try(InputStream in=getContentResolver().openInputStream(uri)){BitmapFactory.decodeStream(in,null,bounds);}
+                int sample=1;while(Math.max(bounds.outWidth,bounds.outHeight)/sample>1600)sample*=2;
+                BitmapFactory.Options options=new BitmapFactory.Options();options.inSampleSize=sample;
+                Bitmap bitmap;try(InputStream in=getContentResolver().openInputStream(uri)){bitmap=BitmapFactory.decodeStream(in,null,options);}
+                if(bitmap==null)throw new IOException("تصویر خوانده نشد.");
+                ByteArrayOutputStream out=new ByteArrayOutputStream();bitmap.compress(Bitmap.CompressFormat.JPEG,78,out);bitmap.recycle();
+                if(out.size()>MAX_FILE)throw new IOException("تصویر بزرگ است؛ تصویر کوچک‌تری انتخاب کنید.");
+                pendingImage="data:image/jpeg;base64,"+Base64.encodeToString(out.toByteArray(),Base64.NO_WRAP);
+                pendingText="";pendingName=displayName;
+            }else if(mime.startsWith("text/")||mime.equals("application/json")||displayName.endsWith(".csv")||displayName.endsWith(".txt")){
+                ByteArrayOutputStream out=new ByteArrayOutputStream();
+                try(InputStream in=getContentResolver().openInputStream(uri)){
+                    byte[] buffer=new byte[4096];int n;
+                    while((n=in.read(buffer))!=-1){out.write(buffer,0,n);if(out.size()>MAX_FILE)throw new IOException("فایل متنی بیش از ۲ مگابایت است.");}
+                }
+                pendingText=out.toString("UTF-8");if(pendingText.length()>40000)pendingText=pendingText.substring(0,40000)+"\n[ادامه فایل به دلیل محدودیت حجم حذف شد]";
+                pendingImage="";pendingName=displayName;
+            }else{toast("فعلاً عکس، صدا و فایل متنی/CSV/JSON پشتیبانی می‌شود؛ PDF و Word هنوز فعال نیستند.");return;}
+            if(selected==6) {
+                String draft=chatInput==null?"":chatInput.getText().toString();
+                showFeature();chatInput.setText(draft);
+            }
+            toast("پیوست آماده ارسال است.");
+        }catch(Exception e){toast("خواندن فایل ناموفق بود: "+e.getMessage());}
+    }
+    private void transcribeAudio(File audio,String filename,String mime){
+        if(busy){toast("ابتدا منتظر پاسخ فعلی باشید.");return;}
+        String key=getKey();if(key.isEmpty()){toast("کلید AvalAI را در تنظیمات وارد کنید.");return;}
+        busy=true;
+        executor.execute(()->{
+            try{
+                URL url=new URL(apiUrl()+"/audio/transcriptions");
+                if(!"https".equalsIgnoreCase(url.getProtocol()))throw new IOException("HTTPS الزامی است.");
+                String boundary="----choobkhat"+System.currentTimeMillis();
+                HttpURLConnection conn=(HttpURLConnection)url.openConnection();
+                try{
+                    conn.setRequestMethod("POST");conn.setConnectTimeout(15000);conn.setReadTimeout(90000);conn.setDoOutput(true);
+                    conn.setRequestProperty("Authorization","Bearer "+key);
+                    conn.setRequestProperty("Content-Type","multipart/form-data; boundary="+boundary);
+                    try(OutputStream out=conn.getOutputStream();FileInputStream in=new FileInputStream(audio)){
+                        String audioType=mime.startsWith("audio/")?mime:"audio/mp4";
+                        String extension=audioType.contains("mpeg")?"mp3":audioType.contains("wav")?"wav":audioType.contains("ogg")?"ogg":"m4a";
+                        String header="--"+boundary+"\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\n"+
+                            prefs.getString("transcription_model","groq.whisper-large-v3")+"\r\n"+
+                            "--"+boundary+"\r\nContent-Disposition: form-data; name=\"file\"; filename=\"audio."+extension+"\"\r\nContent-Type: "+audioType+"\r\n\r\n";
+                        out.write(header.getBytes(StandardCharsets.UTF_8));byte[] buf=new byte[8192];int n;
+                        while((n=in.read(buf))!=-1)out.write(buf,0,n);
+                        out.write(("\r\n--"+boundary+"--\r\n").getBytes(StandardCharsets.UTF_8));
+                    }
+                    int code=conn.getResponseCode();InputStream stream=code>=200&&code<300?conn.getInputStream():conn.getErrorStream();
+                    ByteArrayOutputStream bytes=new ByteArrayOutputStream();try(InputStream in=stream){byte[] b=new byte[4096];int n;while((n=in.read(b))!=-1){bytes.write(b,0,n);if(bytes.size()>MAX_FILE)throw new IOException("پاسخ بزرگ است.");}}
+                    String body=bytes.toString("UTF-8");if(code<200||code>=300)throw new IOException("HTTP "+code+": "+body.substring(0,Math.min(150,body.length())));
+                    String transcript=new JSONObject(body).optString("text","");if(transcript.isEmpty())throw new IOException("متن صدا دریافت نشد.");
+                    main.post(()->{busy=false;if(selected==6){chatInput.setText(transcript);toast("متن صدا آماده است؛ برای ارسال، دکمه ارسال را بزنید.");}});
+                }finally{conn.disconnect();}
+            }catch(Exception e){main.post(()->{busy=false;toast("تبدیل صدا ناموفق بود: "+e.getMessage());});}
+            finally{audio.delete();}
         });
     }
     private String apiUrl() { return prefs.getString("api_url","https://api.avalai.ir/v1").replaceAll("/+$", ""); }
@@ -193,5 +375,9 @@ public class MainActivity extends Activity {
         }catch(Exception e){return "";}
     }
     private void toast(String s){Toast.makeText(this,s,Toast.LENGTH_LONG).show();}
-    @Override protected void onDestroy(){executor.shutdownNow();super.onDestroy();}
+    @Override protected void onDestroy(){
+        if(recorder!=null){try{recorder.stop();}catch(Exception ignored){}recorder.release();recorder=null;}
+        if(tts!=null){tts.stop();tts.shutdown();}
+        executor.shutdownNow();super.onDestroy();
+    }
 }
